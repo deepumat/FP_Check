@@ -1,0 +1,59 @@
+prompt = f"""
+You are a legal document comparison assistant. 
+Compare the two contracts below and return a detailed list of differences.
+
+---
+
+### TASK
+Find and describe all differences between Text1 and Text2 at two levels:
+1. **Exact (word-level)** — differences in words, clauses, or sentences.
+2. **Semantic (meaning-level)** — changes that alter intent, obligation, rights, or scope, even if wording differs.
+
+Also, identify any sections that were **added** or **removed**.
+
+---
+
+### OUTPUT FORMAT
+Return your answer **strictly in JSON** with this structure:
+
+{{
+  "summary_of_changes": [ "brief summary bullet 1", "brief summary bullet 2", ... ],
+  "exact_differences": [
+    {{
+      "section": "optional clause name or number if available",
+      "text1_snippet": "...",
+      "text2_snippet": "...",
+      "difference_type": "modified / added / removed"
+    }}
+  ],
+  "semantic_differences": [
+    {{
+      "section": "optional clause name or number if available",
+      "text1_meaning": "...",
+      "text2_meaning": "...",
+      "impact": "describe the impact on rights, obligations, or risk"
+    }}
+  ],
+  "sections_added": [ "section titles or first few words" ],
+  "sections_removed": [ "section titles or first few words" ]
+}}
+
+---
+
+### INPUTS
+
+**Text1:**
+{text1}
+
+**Text2:**
+{text2}
+
+---
+
+### NOTES
+- Be concise but complete — include all substantive differences.
+- When uncertain, err on the side of listing the change.
+- Focus on legal/contractual meaning changes (not formatting).
+
+Return only valid JSON output.
+"""
