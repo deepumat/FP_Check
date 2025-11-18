@@ -1,70 +1,148 @@
 """
-PCA scatter of word embeddings with interactive hover showing the word and centroid.
+PCA scatter for two sets of word embeddings (main + extra).
+
+Features:
+ - Projects both sets with the same PCA.
+ - Main and extra points plotted in different colors/markers/sizes.
+ - Centroid of the main set is shown.
+ - Hovering shows the word label.
+ - Clicking on a point prints the word.
+ - Optional arrows drawn from centroid to extra points.
+ - Returns PCA, coords, words, centroid for programmatic use.
+
 Requirements:
     pip install numpy matplotlib scikit-learn
-Run in a Python environment with a GUI/interactive matplotlib backend (Jupyter, or python with TkAgg/Qt5Agg).
+Run in an environment with an interactive matplotlib backend (Jupyter, or python with TkAgg/Qt5Agg).
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from typing import Dict, Tuple, Optional
 
-def plot_embeddings_pca(word_embeddings,
-                        title="PCA of word embeddings",
-                        marker_size=40,
-                        centroid_marker_size=140,
-                        hover_dist_thresh=0.04):
+def plot_two_embedding_sets(
+    main_embeddings: Dict[str, np.ndarray],
+    extra_embeddings: Optional[Dict[str, np.ndarray]] = None,
+    title: str = "PCA of Embeddings",
+    main_color: str = "tab:blue",
+    extra_color: str = "tab:orange",
+    main_marker: str = "o",
+    extra_marker: str = "D",
+    main_marker_size: int = 60,
+    extra_marker_size: int = 80,
+    centroid_color: str = "black",
+    centroid_marker: str = "X",
+    centroid_marker_size: int = 220,
+    hover_dist_thresh: float = 0.04,
+    draw_arrows_to_extra: bool = False,
+    show_grid: bool = True,
+    show_legend: bool = True
+) -> Dict:
     """
-    Plot 2D PCA projection of embeddings with interactive hover to show the word.
+    Plot two embedding sets after projecting with the same PCA.
     Args:
-        word_embeddings: dict mapping word (str) -> 1D array-like embedding (all same length)
-        title: plot title
-        marker_size: scatter marker size for points
-        centroid_marker_size: marker size for centroid
-        hover_dist_thresh: fraction of axis span used to decide hover sensitivity (0..1)
+        main_embeddings: dict[word] -> 1D array-like
+        extra_embeddings: optional dict[word] -> 1D array-like
+        draw_arrows_to_extra: if True, draw arrows from centroid to each extra point
     Returns:
-        dict with keys: "pca" (fitted PCA object), "coords" (n x 2 array), "words" (list), "centroid" (1x2)
+        dict with keys: pca, main_coords, extra_coords, centroid, words_main, words_extra
     """
-    # --- prepare data
-    if not isinstance(word_embeddings, dict) or len(word_embeddings) == 0:
-        raise ValueError("word_embeddings must be a non-empty dict {word: embedding_vector}")
 
-    words = list(word_embeddings.keys())
-    X = np.vstack([np.asarray(word_embeddings[w]) for w in words])
-    if X.ndim != 2:
-        raise ValueError("embeddings should be 1D vectors of equal length")
+    # --- Input checks
+    if not isinstance(main_embeddings, dict) or len(main_embeddings) == 0:
+        raise ValueError("main_embeddings must be a non-empty dict {word: vector}")
+
+    words_main = list(main_embeddings.keys())
+    X_main = np.vstack([np.asarray(main_embeddings[w]) for w in words_main])
+    if X_main.ndim != 2:
+        raise ValueError("Main embeddings should be 1D vectors of equal length")
+
+    if extra_embeddings:
+        words_extra = list(extra_embeddings.keys())
+        X_extra = np.vstack([np.asarray(extra_embeddings[w]) for w in words_extra])
+        if X_extra.shape[1] != X_main.shape[1]:
+            raise ValueError("Main and extra embeddings must have same dimensionality")
+        X_all = np.vstack([X_main, X_extra])
+        all_words = words_main + words_extra
+    else:
+        words_extra = []
+        X_extra = np.zeros((0, X_main.shape[1]))
+        X_all = X_main
+        all_words = words_main
 
     # --- PCA to 2D
     pca = PCA(n_components=2)
-    X2 = pca.fit_transform(X)  # shape (n_words, 2)
+    X2_all = pca.fit_transform(X_all)
+    X2_main = X2_all[:len(words_main)]
+    X2_extra = X2_all[len(words_main):] if len(words_extra) else np.zeros((0,2))
+    centroid = X2_main.mean(axis=0)
 
-    # centroid in PCA space
-    centroid = X2.mean(axis=0)
+    # --- Plot
+    fig, ax = plt.subplots(figsize=(10, 7))
 
-    # --- plot
-    fig, ax = plt.subplots(figsize=(9, 6))
-    pts = ax.scatter(X2[:, 0], X2[:, 1], s=marker_size, picker=True)
-    # centroid marker (distinct)
-    ax.scatter([centroid[0]], [centroid[1]], s=centroid_marker_size, marker='X', label='centroid')
+    pts_main = ax.scatter(
+        X2_main[:,0], X2_main[:,1],
+        s=main_marker_size,
+        c=main_color,
+        marker=main_marker,
+        label="Main set",
+        edgecolors="w",
+        linewidths=0.6,
+        zorder=2
+    )
+
+    pts_extra = None
+    if len(words_extra):
+        pts_extra = ax.scatter(
+            X2_extra[:,0], X2_extra[:,1],
+            s=extra_marker_size,
+            c=extra_color,
+            marker=extra_marker,
+            label="Extra set",
+            edgecolors="w",
+            linewidths=0.6,
+            zorder=3
+        )
+
+    # centroid marker
+    ax.scatter([centroid[0]], [centroid[1]],
+               s=centroid_marker_size,
+               c=centroid_color,
+               marker=centroid_marker,
+               label="Centroid (main)",
+               zorder=4)
+
+    # Optional arrows from centroid -> each extra point
+    if draw_arrows_to_extra and len(words_extra):
+        for ex_pt in X2_extra:
+            ax.annotate(
+                "", xy=(ex_pt[0], ex_pt[1]), xytext=(centroid[0], centroid[1]),
+                arrowprops=dict(arrowstyle="->", color=extra_color, alpha=0.6, linewidth=1.2),
+                zorder=1
+            )
+
     ax.set_title(title)
     ax.set_xlabel("PC 1")
     ax.set_ylabel("PC 2")
-    ax.grid(True, linestyle='--', alpha=0.4)
+    if show_grid:
+        ax.grid(True, linestyle="--", alpha=0.35)
+    if show_legend:
+        ax.legend()
 
-    # annotation used for hover
-    annot = ax.annotate("", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
+    # --- Hover annotation
+    annot = ax.annotate("", xy=(0,0), xytext=(10,10), textcoords="offset points",
                         bbox=dict(boxstyle="round", fc="w"),
                         arrowprops=dict(arrowstyle="->"))
     annot.set_visible(False)
 
-    xdata = X2[:, 0]
-    ydata = X2[:, 1]
+    # Combined coords and words for easy nearest lookup
+    coords = X2_all
+    words_all = all_words
 
-    def update_annot(i):
-        pos = (xdata[i], ydata[i])
-        annot.xy = pos
-        annot.set_text(words[i])
-        annot.get_bbox_patch().set_alpha(0.9)
+    def update_annot(i:int):
+        annot.xy = (coords[i,0], coords[i,1])
+        annot.set_text(words_all[i])
+        annot.get_bbox_patch().set_alpha(0.95)
 
     def on_move(event):
         if event.inaxes != ax:
@@ -73,12 +151,12 @@ def plot_embeddings_pca(word_embeddings,
                 fig.canvas.draw_idle()
             return
 
-        # compute distances in data coords
-        dx = xdata - event.xdata
-        dy = ydata - event.ydata
+        # compute distances
+        dx = coords[:,0] - event.xdata
+        dy = coords[:,1] - event.ydata
         dist = np.hypot(dx, dy)
 
-        # threshold in data units: use axis span * hover_dist_thresh
+        # threshold in data units
         xspan = ax.get_xlim()[1] - ax.get_xlim()[0]
         yspan = ax.get_ylim()[1] - ax.get_ylim()[0]
         thresh = hover_dist_thresh * max(xspan, yspan)
@@ -94,51 +172,71 @@ def plot_embeddings_pca(word_embeddings,
                 annot.set_visible(False)
                 fig.canvas.draw_idle()
 
-    # Optional: clicking can also print or return the word (example)
+    # Clicking prints the word and which set it belongs to
     def on_click(event):
         if event.inaxes != ax:
             return
-        # find nearest point
-        dx = xdata - event.xdata
-        dy = ydata - event.ydata
+        dx = coords[:,0] - event.xdata
+        dy = coords[:,1] - event.ydata
         dist = np.hypot(dx, dy)
-        nearest = np.argmin(dist)
         xspan = ax.get_xlim()[1] - ax.get_xlim()[0]
         yspan = ax.get_ylim()[1] - ax.get_ylim()[0]
         thresh = hover_dist_thresh * max(xspan, yspan)
+        nearest = np.argmin(dist)
         if dist[nearest] < thresh:
-            print("Clicked word:", words[nearest])
+            word = words_all[nearest]
+            set_name = "main" if nearest < len(words_main) else "extra"
+            print(f"Clicked: '{word}'  (set: {set_name})")
 
-    # connect events
     fig.canvas.mpl_connect("motion_notify_event", on_move)
     fig.canvas.mpl_connect("button_press_event", on_click)
 
-    plt.legend(loc='best')
     plt.tight_layout()
     plt.show()
 
-    return {"pca": pca, "coords": X2, "words": words, "centroid": centroid}
-
-
-# ---------------------------
-# Example usage:
-# ---------------------------
-if __name__ == "__main__":
-    # Example: random demo embeddings (replace with your real dict)
-    demo_embeddings = {
-        "apple": np.random.normal(size=64) + np.linspace(0, 1, 64),
-        "banana": np.random.normal(size=64) + np.linspace(0.1, 0.9, 64),
-        "car": np.random.normal(size=64) - np.linspace(0, 1, 64),
-        "train": np.random.normal(size=64) - np.linspace(0.2, 1.2, 64),
-        "cat": np.random.normal(size=64) + np.sin(np.linspace(0, 6, 64)),
-        "dog": np.random.normal(size=64) + np.cos(np.linspace(0, 6, 64)),
+    return {
+        "pca": pca,
+        "main_coords": X2_main,
+        "extra_coords": X2_extra,
+        "centroid": centroid,
+        "words_main": words_main,
+        "words_extra": words_extra
     }
 
-    # Replace demo_embeddings with your dict: my_dict = {"word": embedding_array, ...}
-    result = plot_embeddings_pca(demo_embeddings, title="Demo: Word Embeddings PCA")
 
-    # result["coords"] contains the 2D coordinates and result["centroid"] the centroid.
+# -------------------------
+# Example usage
+# -------------------------
+if __name__ == "__main__":
+    # Main embeddings (example)
+    main_emb = {
+        "apple": np.random.normal(size=128) + np.linspace(0,1,128),
+        "banana": np.random.normal(size=128) + np.linspace(0.1,0.9,128),
+        "cat": np.random.normal(size=128) + np.sin(np.linspace(0,6,128)),
+        "dog": np.random.normal(size=128) + np.cos(np.linspace(0,6,128)),
+    }
+
+    # Extra embeddings (example)
+    extra_emb = {
+        "orange": np.random.normal(size=128),
+        "lion": np.random.normal(size=128),
+        "car": np.random.normal(size=128),
+    }
+
+    # Call with arrows, different marker/size, and interactive hover/click enabled
+    result = plot_two_embedding_sets(
+        main_emb,
+        extra_emb,
+        title="Main vs Extra Embeddings (PCA)",
+        main_color="tab:blue",
+        extra_color="tab:orange",
+        main_marker="o",
+        extra_marker="s",
+        main_marker_size=80,
+        extra_marker_size=120,
+        draw_arrows_to_extra=True
+    )
+
     print("Centroid (PC space):", result["centroid"])
-    print("First few word coords:")
-    for w, coord in zip(result["words"], result["coords"]):
-        print(f"  {w}: ({coord[0]:.3f}, {coord[1]:.3f})")
+    print("Main coords shape:", result["main_coords"].shape)
+    print("Extra coords shape:", result["extra_coords"].shape)
