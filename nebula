@@ -1,0 +1,105 @@
+"""
+nebula_example.py
+Simple example using nebula3-python:
+- create a space
+- create a tag and an edge type
+- insert two vertices and an edge
+- run a simple MATCH/GO query to fetch the inserted data
+"""
+
+from nebula3.Config import Config
+from nebula3.gclient.net import ConnectionPool
+import json
+import sys
+import time
+
+# CONFIG: adjust if your docker host differs
+NEBULA_HOST = "127.0.0.1"
+NEBULA_PORT = 9669
+NEBULA_USER = "root"
+NEBULA_PASS = "nebula"   # change if your compose sets different password
+
+SPACE = "demo_space"
+
+def exec_ngql(session, stmt):
+    resp = session.execute(stmt)
+    if not resp.is_succeeded():
+        # try to print reason
+        print("FAILED:", stmt)
+        try:
+            print(resp.error_msg())
+        except Exception:
+            pass
+        return None
+    return resp
+
+def main():
+    # init connection pool
+    config = Config()
+    config.max_connection_pool_size = 10
+    pool = ConnectionPool()
+    ok = pool.init([(NEBULA_HOST, NEBULA_PORT)], config)
+    if not ok:
+        print("Failed to init connection pool. Is Nebula running on", NEBULA_HOST, NEBULA_PORT)
+        sys.exit(1)
+
+    # get session: (user, password)
+    session = pool.get_session(NEBULA_USER, NEBULA_PASS)
+    try:
+        # 1) create space and use it
+        # vid_type=FIXED_STRING(32) is good for string vertex ids
+        create_space = f'''
+        CREATE SPACE IF NOT EXISTS {SPACE} (partition_num=1, replica_factor=1, vid_type=FIXED_STRING(32));
+        USE {SPACE};
+        '''
+        print("Creating space...")
+        exec_ngql(session, create_space)
+        # small wait for meta to settle in local single-machine
+        time.sleep(1)
+
+        # 2) create tag and edge type
+        schema_stmts = '''
+        CREATE TAG IF NOT EXISTS Person(name string, age int);
+        CREATE EDGE IF NOT EXISTS Knows(since int);
+        '''
+        print("Creating tag and edge types...")
+        exec_ngql(session, schema_stmts)
+
+        # 3) insert vertices (vertex id as fixed-string)
+        insert_vertices = '''
+        INSERT VERTEX Person(name, age) VALUES "alice":("Alice", 30), "bob":("Bob", 28);
+        '''
+        print("Inserting vertices...")
+        exec_ngql(session, insert_vertices)
+
+        # 4) insert an edge alice -[Knows]-> bob
+        insert_edge = '''
+        INSERT EDGE Knows(since) VALUES "alice"->"bob":(2020);
+        '''
+        print("Inserting edge...")
+        exec_ngql(session, insert_edge)
+
+        # 5) simple query: get neighbors of alice
+        query = 'GO FROM "alice" OVER Knows YIELD $$.Person.name AS friend, Knows.since AS since;'
+        print("Querying graph:", query)
+        res = exec_ngql(session, query)
+        if res:
+            # convert to JSON-like output
+            try:
+                print("Result rows:")
+                print(res.to_string())
+                # If supported, get JSON
+                json_resp = session.execute_json(query)
+                parsed = json.loads(json_resp)
+                print(json.dumps(parsed, indent=2))
+            except Exception:
+                # fallback: print rows
+                print(res.row_values())
+    finally:
+        # release session and close pool
+        pool.release(session)
+        pool.close()
+        print("Done.")
+
+if __name__ == "__main__":
+    main()
