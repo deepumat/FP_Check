@@ -1,3 +1,4 @@
+import ast
 import streamlit as st
 import pandas as pd
 
@@ -22,11 +23,18 @@ MAX_CONNECTIONS = 10
 # -------------------------------------------------------
 
 
+# Color code for node types
+TAG_COLOR_MAP = {
+    "BaseAgreement": "green",
+    "Executable": "orange",
+    "Supplier": "blue",
+    "Clause": "purple",
+    "SupportingDocument": "brown",
+}
+
+
 @st.cache_resource
 def init_connection_pool() -> ConnectionPool:
-    """
-    Create a Nebula Graph connection pool using hard-coded values.
-    """
     config = Config()
     config.max_connection_pool_size = MAX_CONNECTIONS
 
@@ -40,9 +48,6 @@ def init_connection_pool() -> ConnectionPool:
 
 
 def get_session(pool: ConnectionPool) -> Session:
-    """
-    Get a session using hard-coded user + password.
-    """
     session = pool.get_session(NEBULA_USER, NEBULA_PASSWORD)
     if not session:
         raise RuntimeError("Failed to create Nebula Graph session")
@@ -50,25 +55,19 @@ def get_session(pool: ConnectionPool) -> Session:
 
 
 def execute_query(session: Session, query: str) -> ResultSet:
-    """
-    Execute nGQL inside hard-coded SPACE.
-    """
     use_space = f"USE {NEBULA_SPACE};"
     resp = session.execute(use_space)
     if not resp.is_succeeded():
-        raise RuntimeError(f"Failed to USE space {NEBULA_SPACE}: {resp.error_msg()}")
+        raise RuntimeError(resp.error_msg())
 
     resp = session.execute(query)
     if not resp.is_succeeded():
-        raise RuntimeError(f"Query failed: {resp.error_msg()}")
+        raise RuntimeError(resp.error_msg())
+
     return resp
 
 
 def resultset_to_df(resp: ResultSet) -> pd.DataFrame:
-    """
-    Convert ResultSet to DataFrame.
-    NOTE: We cast values to string for display/filters.
-    """
     col_names = resp.keys()
     rows = []
 
@@ -82,62 +81,88 @@ def resultset_to_df(resp: ResultSet) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=col_names)
 
 
-def visualize_graph(conn_df: pd.DataFrame, center_vid: str | None = None):
-    """
-    Build and display an interactive graph using pyvis in Streamlit.
+def parse_tag_list(tag_str: str):
+    if tag_str is None:
+        return []
+    try:
+        parsed = ast.literal_eval(tag_str)
+        if isinstance(parsed, list):
+            return [str(t) for t in parsed]
+        return [str(parsed)]
+    except:
+        s = tag_str.strip().strip("[]")
+        if not s:
+            return []
+        return [x.strip().strip('"').strip("'") for x in s.split(",")]
 
-    conn_df must contain at least columns:
-      - src
-      - dst
-      - edge_type (optional, used as tooltip)
-    """
-    if conn_df.empty:
-        st.info("No connections to visualize (after filters).")
+
+def pick_color(tags: list[str], is_center=False):
+    if is_center:
+        return "red"
+
+    for t in tags:
+        if t in TAG_COLOR_MAP:
+            return TAG_COLOR_MAP[t]
+    return "gray"
+
+
+def visualize_graph(df_conn: pd.DataFrame, df_start: pd.DataFrame):
+    if df_conn.empty:
+        st.info("No graph data to visualize.")
         return
 
-    net = Network(height="600px", width="100%", directed=True, notebook=False)
+    center_vid = str(df_start.iloc[0]["vid"])
+    center_tags = parse_tag_list(df_start.iloc[0]["tags"])
 
-    # Add nodes and edges
-    for _, row in conn_df.iterrows():
+    net = Network(height="650px", width="100%", directed=True)
+
+    # Add the center node first
+    net.add_node(
+        center_vid,
+        label=center_vid,
+        color="red",
+        size=30,
+        title=f"Center Node: {center_vid}\nTags: {center_tags}",
+    )
+
+    # Add all edges and nodes
+    for _, row in df_conn.iterrows():
         src = str(row["src"])
         dst = str(row["dst"])
-        edge_type = str(row["edge_type"]) if "edge_type" in conn_df.columns else ""
+        edge_type = str(row["edge_type"])
 
-        # Add / update src node
-        if center_vid is not None and src == str(center_vid):
+        src_tags = parse_tag_list(row["src_tags"])
+        dst_tags = parse_tag_list(row["dst_tags"])
+
+        # Add src node (skip if center)
+        if src != center_vid:
             net.add_node(
                 src,
                 label=src,
-                color="red",
-                size=25,
-                title=f"Center node: {src}",
+                color=pick_color(src_tags),
+                size=20,
+                title=f"{src}\nTags: {src_tags}",
             )
-        else:
-            net.add_node(src, label=src)
 
-        # Add / update dst node
-        if center_vid is not None and dst == str(center_vid):
+        # Add dst node (skip if center)
+        if dst != center_vid:
             net.add_node(
                 dst,
                 label=dst,
-                color="red",
-                size=25,
-                title=f"Center node: {dst}",
+                color=pick_color(dst_tags),
+                size=20,
+                title=f"{dst}\nTags: {dst_tags}",
             )
-        else:
-            net.add_node(dst, label=dst)
 
-        # Add edge
+        # Add edges
         net.add_edge(src, dst, title=edge_type)
 
     net.toggle_physics(True)
 
-    # Save and render inside Streamlit
-    html_file = "graph.html"
-    net.save_graph(html_file)
-    with open(html_file, "r", encoding="utf-8") as f:
-        html = f.read()
-    components.html(html, height=600, scrolling=True)
+    html = "graph.html"
+    net.save_graph(html)
+    with open(html, "r", encoding="utf-8") as f:
+        components.html(f.read(), height=650, scrolling=True)
 
 
 # -------------------------------------------------------
@@ -145,148 +170,118 @@ def visualize_graph(conn_df: pd.DataFrame, center_vid: str | None = None):
 # -------------------------------------------------------
 
 def main():
-    st.title("Nebula Graph – Node Connections Explorer")
+    st.title("Nebula Graph – Contract Explorer")
 
-    # Connect once (hard-coded)
     try:
         pool = init_connection_pool()
         session = get_session(pool)
-        st.success(
-            f"Connected to Nebula Graph at {NEBULA_HOST}:{NEBULA_PORT}, "
-            f"space `{NEBULA_SPACE}`."
-        )
+        st.success("Connected to Nebula Graph successfully.")
     except Exception as e:
-        st.error(f"Failed to connect to Nebula Graph: {e}")
+        st.error(f"Connection failed: {e}")
         return
 
-    st.subheader("Search connections for a node")
+    st.subheader("Node Lookup")
+    node_name = st.text_input("Node name (property `name`):", placeholder="Supplier A")
 
-    node_name = st.text_input(
-        "Node name (value of property `name`):",
-        placeholder="e.g., Supplier A, Base Agreement 123",
-    )
-
-    st.markdown("#### Optional filters")
-
-    # User input: edge type filtering
-    edge_type_filter = st.text_input(
-        "Edge types to include (comma-separated, blank = all):",
-        placeholder="e.g., ExecutableEdge, SupplierOf, ContainsClause",
-    )
-
-    # User input: vertex tag filtering for connected nodes
-    tag_filter = st.text_input(
-        "Vertex tags for connected nodes (comma-separated, blank = all):",
-        placeholder="e.g., BaseAgreement, Executable, Supplier, Clause",
-    )
-
-    if st.button("Get connections"):
+    if st.button("Run query"):
         if not node_name.strip():
             st.warning("Please enter a node name.")
             return
 
         safe_name = node_name.replace('"', '\\"')
 
-        # Query 1: starting node details
-        start_node_query = f"""
+        # Query for the selected node
+        q1 = f"""
         MATCH (v)
         WHERE v.name == "{safe_name}"
-        RETURN
-            id(v) AS vid,
-            labels(v) AS tags,
-            properties(v) AS props;
+        RETURN id(v) AS vid, labels(v) AS tags, properties(v) AS props;
         """
 
-        # Query 2: all neighbors + edges
-        # We get everything first, then filter in Python based on the user inputs.
-        connections_query = f"""
+        # Query for connections
+        q2 = f"""
         MATCH (v)-[e]-(n)
         WHERE v.name == "{safe_name}"
         RETURN
-            id(v) AS src,
-            labels(v) AS src_tags,
-            properties(v) AS src_props,
-            id(n) AS dst,
-            labels(n) AS dst_tags,
-            properties(n) AS dst_props,
-            type(e) AS edge_type,
-            e AS edge_props;
+            id(v) AS src, labels(v) AS src_tags, properties(v) AS src_props,
+            id(n) AS dst, labels(n) AS dst_tags, properties(n) AS dst_props,
+            type(e) AS edge_type, e AS edge_props;
         """
 
         try:
-            # Run both queries
-            start_resp = execute_query(session, start_node_query)
-            conn_resp = execute_query(session, connections_query)
+            df_start = resultset_to_df(execute_query(session, q1))
+            df_conn_raw = resultset_to_df(execute_query(session, q2))
 
-            with st.expander("Show executed nGQL"):
-                st.code(start_node_query.strip(), language="sql")
-                st.code(connections_query.strip(), language="sql")
-
-            # Node details
-            st.markdown("### Node details")
-            if start_resp.is_empty():
-                st.error("No node found with this `name`.")
+            if df_start.empty:
+                st.error("No such node found.")
                 return
 
-            df_start = resultset_to_df(start_resp)
-            st.dataframe(df_start, use_container_width=True)
-
-            # Determine center VID from first row
-            center_vid = str(df_start.iloc[0]["vid"])
-
-            # Connections
-            if conn_resp.is_empty():
-                st.info("Node exists but has no connected edges.")
-                return
-
-            df_conn = resultset_to_df(conn_resp)
-
-            # ---------------------------------------------------
-            # Apply edge-type filter if provided
-            # ---------------------------------------------------
-            if edge_type_filter.strip():
-                edge_types = [
-                    e.strip()
-                    for e in edge_type_filter.split(",")
-                    if e.strip()
-                ]
-                df_conn = df_conn[df_conn["edge_type"].isin(edge_types)]
-
-            # ---------------------------------------------------
-            # Apply tag filter if provided (on src_tags OR dst_tags)
-            # df_conn["src_tags"] / ["dst_tags"] are strings like: ["Supplier"]
-            # We just check substring membership for simplicity.
-            # ---------------------------------------------------
-            if tag_filter.strip():
-                tags = [
-                    t.strip()
-                    for t in tag_filter.split(",")
-                    if t.strip()
-                ]
-
-                def has_any_tag(tag_str: str) -> bool:
-                    return any(t in tag_str for t in tags)
-
-                df_conn = df_conn[
-                    df_conn["src_tags"].apply(has_any_tag)
-                    | df_conn["dst_tags"].apply(has_any_tag)
-                ]
-
-            st.markdown("### Connected nodes and edges (after filters)")
-            if df_conn.empty:
-                st.info("No connections match the specified filters.")
-                return
-
-            st.dataframe(df_conn, use_container_width=True)
-
-            # ---------------------------------------------------
-            # Graph visualization (for filtered connections)
-            # ---------------------------------------------------
-            st.markdown("### Graph visualization")
-            visualize_graph(df_conn, center_vid=center_vid)
+            st.session_state["df_start"] = df_start
+            st.session_state["df_conn_raw"] = df_conn_raw
 
         except Exception as e:
-            st.error(f"Error running query: {e}")
+            st.error(f"Query error: {e}")
+            return
+
+    # ---------------------------------------------------
+    # Display + Filters + Graph (After Query Runs)
+    # ---------------------------------------------------
+
+    if "df_start" in st.session_state:
+        df_start = st.session_state["df_start"]
+        df_conn_raw = st.session_state["df_conn_raw"]
+
+        st.markdown("### Node Details")
+        st.dataframe(df_start)
+
+        if df_conn_raw.empty:
+            st.info("This node has no connected edges.")
+            return
+
+        # Build available lists
+        edge_types = sorted(df_conn_raw["edge_type"].unique())
+
+        tag_set = set()
+        for col in ["src_tags", "dst_tags"]:
+            for t in df_conn_raw[col].dropna():
+                tag_set.update(parse_tag_list(t))
+        available_tags = sorted(tag_set)
+
+        # FILTER UI
+        st.subheader("Filters")
+
+        selected_edge_types = st.multiselect(
+            "Edge Types",
+            options=edge_types,
+            default=edge_types,    # all selected by default
+        )
+
+        selected_tags = st.multiselect(
+            "Vertex Tags",
+            options=available_tags,
+            default=["BaseAgreement", "Executable"],   # PRESELECTED TAGS
+        )
+
+        # Apply filters
+        df_conn = df_conn_raw.copy()
+
+        # filter edge types
+        df_conn = df_conn[df_conn["edge_type"].isin(selected_edge_types)]
+
+        # filter tags
+        def node_matches(tag_str):
+            tags = parse_tag_list(tag_str)
+            return any(t in selected_tags for t in tags)
+
+        df_conn = df_conn[
+            df_conn["src_tags"].apply(node_matches)
+            | df_conn["dst_tags"].apply(node_matches)
+        ]
+
+        st.markdown("### Filtered Connections")
+        st.dataframe(df_conn)
+
+        st.markdown("### Graph Visualization")
+        visualize_graph(df_conn, df_start)
 
 
 if __name__ == "__main__":
