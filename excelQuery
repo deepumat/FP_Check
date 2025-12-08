@@ -1,0 +1,201 @@
+#!/usr/bin/env python
+import os
+import json
+import argparse
+import pandas as pd
+from anthropic import Anthropic
+
+# ---------- CONFIG ----------
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620")
+API_KEY_ENV = "ANTHROPIC_API_KEY"
+MAX_TOKENS = 1024
+SAMPLE_ROWS = 5
+# ----------------------------
+
+SYSTEM_PROMPT_TEMPLATE = """
+You are a data-query assistant.
+You will receive:
+- A table schema (column names and dtypes)
+- A few sample rows
+- A natural-language question from the user
+
+Your task is to convert the user's question into a JSON object that describes
+how to query a pandas DataFrame with this structure.
+
+Your response MUST be ONLY valid JSON, with NO markdown, NO backticks, NO commentary.
+
+Use this JSON schema:
+
+{{
+  "select": ["column1", "column2", ...],        // optional; if "ALL" then all columns
+  "filter": { "column or column__op": "value", ... },  // optional
+  "sort": {{ "column": "asc|desc" }},          // optional
+  "limit":  integer                            // optional
+}}
+
+Conventions for filter keys:
+- Equality: "column": value
+- Contains (case-insensitive substring): "column__contains": "substring"
+- Greater than: "column__gt": number
+- Greater or equal: "column__gte": number
+- Less than: "column__lt": number
+- Less or equal: "column__lte": number
+
+Rules:
+- ONLY use columns that exist in the schema.
+- If the user asks for "all columns" or does not specify columns, use: "select": "ALL".
+- If the user doesn't specify sorting, omit "sort".
+- Use "limit" when user says things like "top 10", "first 5", "some examples", etc.
+- NEVER explain anything; just return the JSON object.
+
+Table schema (column: dtype):
+{schema}
+
+Sample rows (JSON records):
+{sample}
+"""
+
+def build_schema_and_sample(df: pd.DataFrame):
+    schema = [
+        {"column": col, "dtype": str(df[col].dtype)}
+        for col in df.columns
+    ]
+    sample = df.head(SAMPLE_ROWS).to_dict(orient="records")
+    return schema, sample
+
+
+def call_claude_to_get_query(schema, sample, user_question: str, model: str = DEFAULT_MODEL):
+    client = Anthropic(api_key=os.environ.get(API_KEY_ENV))
+
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        schema=json.dumps(schema, indent=2),
+        sample=json.dumps(sample, indent=2),
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": f"User question:\n{user_question}\n\nReturn ONLY JSON."
+        }
+    ]
+
+    resp = client.messages.create(
+        model=model,
+        max_tokens=MAX_TOKENS,
+        system=system_prompt,
+        messages=messages,
+    )
+
+    # Claude returns content as a list of blocks; we expect a single text block
+    text = "".join(
+        block.text for block in resp.content
+        if getattr(block, "type", None) == "text"
+    )
+
+    # Be robust: extract the first JSON object from the text
+    return parse_json_safely(text)
+
+
+def parse_json_safely(text: str):
+    text = text.strip()
+
+    # If Claude wraps JSON in ``` or similar, try to strip:
+    if text.startswith("```"):
+        # remove ```json or ``` and final ```
+        text = text.strip("`")
+        # After stripping backticks, there may still be 'json\n'
+        if text.lower().startswith("json"):
+            text = text[4:].lstrip()
+
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Fallback: find first { ... } block
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end+1]
+            return json.loads(candidate)
+        raise
+
+
+def execute_query(df: pd.DataFrame, query: dict) -> pd.DataFrame:
+    result = df.copy()
+
+    # -------- Filters --------
+    filters = query.get("filter") or {}
+    for key, val in filters.items():
+        if "__contains" in key:
+            col = key.replace("__contains", "")
+            result = result[result[col].astype(str).str.contains(str(val), case=False, na=False)]
+        elif "__gt" in key:
+            col = key.replace("__gt", "")
+            result = result[pd.to_numeric(result[col], errors="coerce") > float(val)]
+        elif "__gte" in key:
+            col = key.replace("__gte", "")
+            result = result[pd.to_numeric(result[col], errors="coerce") >= float(val)]
+        elif "__lt" in key:
+            col = key.replace("__lt", "")
+            result = result[pd.to_numeric(result[col], errors="coerce") < float(val)]
+        elif "__lte" in key:
+            col = key.replace("__lte", "")
+            result = result[pd.to_numeric(result[col], errors="coerce") <= float(val)]
+        else:
+            # equality
+            result = result[result[key] == val]
+
+    # -------- Select --------
+    select = query.get("select")
+    if select not in (None, "ALL"):
+        # Keep only existing columns to avoid errors if model hallucinates
+        existing = [c for c in select if c in result.columns]
+        if existing:
+            result = result[existing]
+
+    # -------- Sort --------
+    sort_spec = query.get("sort")
+    if isinstance(sort_spec, dict) and sort_spec:
+        col, order = list(sort_spec.items())[0]
+        if col in result.columns:
+            ascending = (order.lower() == "asc")
+            result = result.sort_values(by=col, ascending=ascending)
+
+    # -------- Limit --------
+    limit = query.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        result = result.head(limit)
+
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Query an Excel file using Claude and natural language.")
+    parser.add_argument("excel_path", help="Path to the Excel file")
+    parser.add_argument("-s", "--sheet", help="Sheet name (optional)", default=None)
+    parser.add_argument("-q", "--question", help="Your natural language question", required=True)
+    args = parser.parse_args()
+
+    if API_KEY_ENV not in os.environ:
+        raise RuntimeError(f"Please set {API_KEY_ENV} in your environment.")
+
+    # Load Excel
+    df = pd.read_excel(args.excel_path, sheet_name=args.sheet)
+
+    # Build schema + sample
+    schema, sample = build_schema_and_sample(df)
+
+    # Get query JSON from Claude
+    query_json = call_claude_to_get_query(schema, sample, args.question)
+    print("=== Query JSON from Claude ===")
+    print(json.dumps(query_json, indent=2))
+
+    # Execute query
+    result_df = execute_query(df, query_json)
+
+    print("\n=== Result (first 50 rows) ===")
+    print(result_df.head(50).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
