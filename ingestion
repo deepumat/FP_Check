@@ -1,0 +1,134 @@
+import os
+from typing import List, Dict
+
+import pandas as pd
+from pypdf import PdfReader
+from docx import Document
+
+# ------------- CONFIG -------------
+CHARS_PER_CHUNK = 3500   # tune as needed
+CHARS_OVERLAP   = 400    # overlap between chunks
+# ----------------------------------
+
+
+def extract_pages_from_pdf(path: str) -> List[str]:
+    """
+    Return a list of page texts from a PDF file path.
+    """
+    reader = PdfReader(path)
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        pages.append(text)
+    return pages
+
+
+def extract_pages_from_docx(path: str) -> List[str]:
+    """
+    Return a list of 'pages' from a DOCX.
+    Here we treat each non-empty paragraph as a pseudo-page.
+    Good enough for chunking + retrieval.
+    """
+    doc = Document(path)
+    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    if not paragraphs:
+        paragraphs = [p.text for p in doc.paragraphs]  # fallback
+    return paragraphs
+
+
+def chunk_pages(
+    pages: List[str],
+    chars_per_chunk: int = CHARS_PER_CHUNK,
+    overlap: int = CHARS_OVERLAP
+) -> List[Dict]:
+    """
+    Concatenate pages and split into overlapping character chunks.
+    Track approximate 'page_start'/'page_end' index.
+    """
+    chunks = []
+    current_chunk = ""
+    current_start_page = 1
+
+    page_with_idx = [(text, i + 1) for i, text in enumerate(pages)]
+
+    for text, page_num in page_with_idx:
+        if not text.strip():
+            continue
+
+        if len(current_chunk) == 0:
+            current_start_page = page_num
+
+        # If adding this page would exceed chunk size, finalize current chunk
+        if len(current_chunk) + len(text) > chars_per_chunk and current_chunk:
+            chunks.append({
+                "page_start": current_start_page,
+                "page_end": page_num,  # approximate
+                "chunk_text": current_chunk
+            })
+
+            # Start new chunk with overlap from previous chunk
+            overlap_text = current_chunk[-overlap:] if overlap > 0 else ""
+            current_chunk = overlap_text + "\n" + text
+            current_start_page = max(page_num, current_start_page)
+        else:
+            # extend current chunk
+            if current_chunk:
+                current_chunk += "\n" + text
+            else:
+                current_chunk = text
+
+    # Final chunk
+    if current_chunk.strip():
+        last_page_num = len(pages)
+        chunks.append({
+            "page_start": current_start_page,
+            "page_end": last_page_num,
+            "chunk_text": current_chunk
+        })
+
+    return chunks
+
+
+def ingest_file_to_csv(input_path: str, output_csv_path: str):
+    """
+    Ingest a PDF or DOCX file, chunk it, and write chunks to CSV.
+
+    CSV columns:
+      - chunk_id
+      - doc_name
+      - page_start
+      - page_end
+      - chunk_text
+    """
+    ext = os.path.splitext(input_path)[1].lower()
+    doc_name = os.path.basename(input_path)
+
+    if ext == ".pdf":
+        pages = extract_pages_from_pdf(input_path)
+    elif ext == ".docx":
+        pages = extract_pages_from_docx(input_path)
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}. Only .pdf and .docx supported.")
+
+    chunk_dicts = chunk_pages(pages)
+
+    rows = []
+    for i, c in enumerate(chunk_dicts):
+        rows.append({
+            "chunk_id": i,
+            "doc_name": doc_name,
+            "page_start": c["page_start"],
+            "page_end": c["page_end"],
+            "chunk_text": c["chunk_text"],
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(output_csv_path, index=False)
+    print(f"Written {len(df)} chunks for {doc_name} to {output_csv_path}")
+
+
+if __name__ == "__main__":
+    # Example usage
+    input_path = "sample.pdf"     # or "sample.docx"
+    output_csv = "sample_chunks.csv"
+    ingest_file_to_csv(input_path, output_csv)
