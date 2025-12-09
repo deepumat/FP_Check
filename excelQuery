@@ -1,201 +1,232 @@
-#!/usr/bin/env python
-import os
-import json
-import argparse
+import os, json, difflib
+from typing import List, Dict, Any, Optional
 import pandas as pd
+import streamlit as st
 from anthropic import Anthropic
 
-# ---------- CONFIG ----------
+# Config
 DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620")
 API_KEY_ENV = "ANTHROPIC_API_KEY"
-MAX_TOKENS = 1024
-SAMPLE_ROWS = 5
-# ----------------------------
+MAX_TOKENS = 1200
+SAMPLE_ROWS = 6
+FUZZY_CUTOFF = 0.6
 
 SYSTEM_PROMPT_TEMPLATE = """
-You are a data-query assistant.
-You will receive:
-- A table schema (column names and dtypes)
-- A few sample rows
-- A natural-language question from the user
+You are a data-query assistant. You will receive a table schema (column names and dtypes),
+a few sample rows, and a user's natural-language question.
 
-Your task is to convert the user's question into a JSON object that describes
-how to query a pandas DataFrame with this structure.
+Return ONLY valid JSON (no markdown, no backticks) using this schema:
 
-Your response MUST be ONLY valid JSON, with NO markdown, NO backticks, NO commentary.
+{
+  "select": ["column1","column2", ...] OR "ALL",
+  "filter": {
+    "and": [ { "column": "colname", "op":"contains|eq|gt|gte|lt|lte|in", "value": ... }, ... ],
+    "or":  [ { "column": "colname", "op":"contains|eq|gt|gte|lt|lte|in", "value": ... }, ... ]
+  },
+  "sort": { "column": "asc|desc" },
+  "limit": integer
+}
 
-Use this JSON schema:
-
-{{
-  "select": ["column1", "column2", ...],        // optional; if "ALL" then all columns
-  "filter": { "column or column__op": "value", ... },  // optional
-  "sort": {{ "column": "asc|desc" }},          // optional
-  "limit":  integer                            // optional
-}}
-
-Conventions for filter keys:
-- Equality: "column": value
-- Contains (case-insensitive substring): "column__contains": "substring"
-- Greater than: "column__gt": number
-- Greater or equal: "column__gte": number
-- Less than: "column__lt": number
-- Less or equal: "column__lte": number
-
-Rules:
-- ONLY use columns that exist in the schema.
-- If the user asks for "all columns" or does not specify columns, use: "select": "ALL".
-- If the user doesn't specify sorting, omit "sort".
-- Use "limit" when user says things like "top 10", "first 5", "some examples", etc.
-- NEVER explain anything; just return the JSON object.
-
+Conventions:
+- "contains" = case-insensitive substring.
+- "in" = a JSON array or comma-separated list.
+- Column names may be approximate; the executor will map them to actual columns.
+- NEVER include code or commentary. Output must be only parsable JSON.
 Table schema (column: dtype):
 {schema}
-
-Sample rows (JSON records):
+Sample rows:
 {sample}
-"""
+""".strip()
 
 def build_schema_and_sample(df: pd.DataFrame):
-    schema = [
-        {"column": col, "dtype": str(df[col].dtype)}
-        for col in df.columns
-    ]
-    sample = df.head(SAMPLE_ROWS).to_dict(orient="records")
-    return schema, sample
+    return [{"column": c, "dtype": str(df[c].dtype)} for c in df.columns], df.head(SAMPLE_ROWS).to_dict(orient="records")
 
-
-def call_claude_to_get_query(schema, sample, user_question: str, model: str = DEFAULT_MODEL):
-    client = Anthropic(api_key=os.environ.get(API_KEY_ENV))
-
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        schema=json.dumps(schema, indent=2),
-        sample=json.dumps(sample, indent=2),
-    )
-
-    messages = [
-        {
-            "role": "user",
-            "content": f"User question:\n{user_question}\n\nReturn ONLY JSON."
-        }
-    ]
-
-    resp = client.messages.create(
-        model=model,
-        max_tokens=MAX_TOKENS,
-        system=system_prompt,
-        messages=messages,
-    )
-
-    # Claude returns content as a list of blocks; we expect a single text block
-    text = "".join(
-        block.text for block in resp.content
-        if getattr(block, "type", None) == "text"
-    )
-
-    # Be robust: extract the first JSON object from the text
-    return parse_json_safely(text)
-
-
-def parse_json_safely(text: str):
+def extract_json_from_text(text: str):
     text = text.strip()
-
-    # If Claude wraps JSON in ``` or similar, try to strip:
     if text.startswith("```"):
-        # remove ```json or ``` and final ```
         text = text.strip("`")
-        # After stripping backticks, there may still be 'json\n'
         if text.lower().startswith("json"):
             text = text[4:].lstrip()
-
-    # Try direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Fallback: find first { ... } block
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            candidate = text[start:end+1]
-            return json.loads(candidate)
+            return json.loads(text[start:end+1])
         raise
 
+def call_claude(df: pd.DataFrame, question: str):
+    if API_KEY_ENV not in os.environ:
+        raise RuntimeError(f"Set {API_KEY_ENV} env var.")
+    client = Anthropic(api_key=os.environ.get(API_KEY_ENV))
+    schema, sample = build_schema_and_sample(df)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(schema=json.dumps(schema, indent=2), sample=json.dumps(sample, indent=2))
+    resp = client.messages.create(
+        model=DEFAULT_MODEL,
+        system=system_prompt,
+        messages=[{"role": "user", "content": f"User question:\n{question}\n\nReturn ONLY JSON."}],
+        max_tokens=MAX_TOKENS,
+    )
+    text = "".join(block.text for block in resp.content if getattr(block, "type", None) == "text")
+    return extract_json_from_text(text)
 
-def execute_query(df: pd.DataFrame, query: dict) -> pd.DataFrame:
-    result = df.copy()
+def map_column_name(requested: str, columns: List[str], cutoff=FUZZY_CUTOFF) -> Optional[str]:
+    for c in columns:
+        if c.lower() == requested.lower():
+            return c
+    matches = difflib.get_close_matches(requested, columns, n=1, cutoff=cutoff)
+    if matches:
+        return matches[0]
+    tokens = [t.lower() for t in requested.replace("_", " ").split()]
+    for c in columns:
+        lowc = c.lower()
+        if any(tok for tok in tokens if tok and tok in lowc):
+            return c
+    return None
 
-    # -------- Filters --------
-    filters = query.get("filter") or {}
-    for key, val in filters.items():
-        if "__contains" in key:
-            col = key.replace("__contains", "")
-            result = result[result[col].astype(str).str.contains(str(val), case=False, na=False)]
-        elif "__gt" in key:
-            col = key.replace("__gt", "")
-            result = result[pd.to_numeric(result[col], errors="coerce") > float(val)]
-        elif "__gte" in key:
-            col = key.replace("__gte", "")
-            result = result[pd.to_numeric(result[col], errors="coerce") >= float(val)]
-        elif "__lt" in key:
-            col = key.replace("__lt", "")
-            result = result[pd.to_numeric(result[col], errors="coerce") < float(val)]
-        elif "__lte" in key:
-            col = key.replace("__lte", "")
-            result = result[pd.to_numeric(result[col], errors="coerce") <= float(val)]
+def evaluate_condition(df: pd.DataFrame, cond: Dict[str, Any]) -> pd.Series:
+    col = cond.get("column_mapped") or cond.get("column")
+    op = cond.get("op", "eq")
+    val = cond.get("value")
+    if col not in df.columns:
+        return pd.Series([False]*len(df), index=df.index)
+    s = df[col]
+    if op == "contains":
+        return s.astype(str).str.contains(str(val), case=False, na=False)
+    if op == "eq":
+        return s == val
+    if op == "gt":
+        return pd.to_numeric(s, errors="coerce") > float(val)
+    if op == "gte":
+        return pd.to_numeric(s, errors="coerce") >= float(val)
+    if op == "lt":
+        return pd.to_numeric(s, errors="coerce") < float(val)
+    if op == "lte":
+        return pd.to_numeric(s, errors="coerce") <= float(val)
+    if op == "in":
+        if isinstance(val, (list, tuple, set)):
+            items = [str(x) for x in val]
+        elif isinstance(val, str):
+            items = [v.strip() for v in val.split(",") if v.strip()]
         else:
-            # equality
-            result = result[result[key] == val]
+            items = [str(val)]
+        return s.astype(str).isin(items)
+    return pd.Series([False]*len(df), index=df.index)
 
-    # -------- Select --------
+def normalize_and_execute(df: pd.DataFrame, query: Dict[str, Any]):
+    warnings = []
+    # Map columns in filter lists
+    fil = query.get("filter")
+    if isinstance(fil, dict):
+        for side in ("and", "or"):
+            if side in fil and isinstance(fil[side], list):
+                for cond in fil[side]:
+                    col = cond.get("column")
+                    if col:
+                        mapped = map_column_name(col, list(df.columns))
+                        if mapped:
+                            cond["column_mapped"] = mapped
+                            if mapped != col:
+                                warnings.append(f"Mapped '{col}' -> '{mapped}'")
+                        else:
+                            cond["column_mapped"] = col
+                            warnings.append(f"Could not map '{col}' to any column (left as-is).")
+    else:
+        # handle legacy flat form later
+        pass
+
+    # Legacy: handle flat filter {... "city__contains": "Delhi"}
+    if not fil:
+        legacy = query.get("filter") or {}
+        if isinstance(legacy, dict) and any("__" in k for k in legacy.keys()):
+            fil = {"and": []}
+            for k, v in legacy.items():
+                if "__" in k:
+                    col, op = k.split("__", 1)
+                    mapped = map_column_name(col, list(df.columns))
+                    fil["and"].append({"column_mapped": mapped or col, "op": op, "value": v})
+            query["filter"] = fil
+
+    # Evaluate masks
+    mask = pd.Series(True, index=df.index)
+    if isinstance(query.get("filter"), dict):
+        f = query["filter"]
+        if "and" in f and isinstance(f["and"], list) and f["and"]:
+            for cond in f["and"]:
+                mask = mask & evaluate_condition(df, cond)
+        if "or" in f and isinstance(f["or"], list) and f["or"]:
+            or_mask = pd.Series(False, index=df.index)
+            for cond in f["or"]:
+                or_mask = or_mask | evaluate_condition(df, cond)
+            mask = (mask & or_mask) if ("and" in f and f["and"]) else or_mask
+    result = df[mask]
+
+    # SELECT
     select = query.get("select")
-    if select not in (None, "ALL"):
-        # Keep only existing columns to avoid errors if model hallucinates
-        existing = [c for c in select if c in result.columns]
-        if existing:
-            result = result[existing]
+    if select and select != "ALL":
+        mapped_select = []
+        for s in select:
+            mapped = map_column_name(s, list(df.columns))
+            if mapped:
+                mapped_select.append(mapped)
+                if mapped != s:
+                    warnings.append(f"Mapped select '{s}' -> '{mapped}'")
+            else:
+                warnings.append(f"Select column '{s}' not found; ignoring.")
+        if mapped_select:
+            result = result.loc[:, mapped_select]
 
-    # -------- Sort --------
+    # SORT
     sort_spec = query.get("sort")
     if isinstance(sort_spec, dict) and sort_spec:
         col, order = list(sort_spec.items())[0]
-        if col in result.columns:
-            ascending = (order.lower() == "asc")
-            result = result.sort_values(by=col, ascending=ascending)
+        mapped = map_column_name(col, list(df.columns))
+        if mapped:
+            result = result.sort_values(by=mapped, ascending=(order.lower()=="asc"))
+        else:
+            warnings.append(f"Sort column '{col}' not found; skipping sort.")
 
-    # -------- Limit --------
+    # LIMIT
     limit = query.get("limit")
     if isinstance(limit, int) and limit > 0:
         result = result.head(limit)
 
-    return result
+    return result, warnings
 
+# ---------------- Streamlit UI ----------------
+st.set_page_config(page_title="Excel NL Query (Claude) — fuzzy & OR", layout="wide")
+st.title("Excel natural-language query (Claude) — OR + fuzzy column names")
 
-def main():
-    parser = argparse.ArgumentParser(description="Query an Excel file using Claude and natural language.")
-    parser.add_argument("excel_path", help="Path to the Excel file")
-    parser.add_argument("-s", "--sheet", help="Sheet name (optional)", default=None)
-    parser.add_argument("-q", "--question", help="Your natural language question", required=True)
-    args = parser.parse_args()
+uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+if uploaded:
+    xls = pd.ExcelFile(uploaded)
+    sheet = st.selectbox("Sheet", xls.sheet_names)
+    df = xls.parse(sheet)
+    st.markdown(f"**Columns:** {', '.join(df.columns[:30])}{'...' if len(df.columns)>30 else ''}")
+    st.dataframe(df.head(8))
 
-    if API_KEY_ENV not in os.environ:
-        raise RuntimeError(f"Please set {API_KEY_ENV} in your environment.")
-
-    # Load Excel
-    df = pd.read_excel(args.excel_path, sheet_name=args.sheet)
-
-    # Build schema + sample
-    schema, sample = build_schema_and_sample(df)
-
-    # Get query JSON from Claude
-    query_json = call_claude_to_get_query(schema, sample, args.question)
-    print("=== Query JSON from Claude ===")
-    print(json.dumps(query_json, indent=2))
-
-    # Execute query
-    result_df = execute_query(df, query_json)
-
-    print("\n=== Result (first 50 rows) ===")
-    print(result_df.head(50).to_string(index=False))
-
-
-if __name__ == "__main__":
-    main()
+    question = st.text_area("Question (natural language)", height=140,
+                           placeholder="e.g. Show rows where city is Bangalore OR city contains 'Delhi' and return customer name and amount. Top 20.")
+    if st.button("Run"):
+        if not question.strip():
+            st.warning("Enter a question.")
+        else:
+            try:
+                with st.spinner("Calling Claude..."):
+                    query_json = call_claude(df, question)
+                st.subheader("JSON returned by Claude")
+                st.json(query_json)
+                with st.spinner("Executing..."):
+                    result_df, warns = normalize_and_execute(df, query_json)
+                if warns:
+                    st.warning("Warnings:\n" + "\n".join(warns))
+                if result_df.empty:
+                    st.info("No rows matched the query.")
+                else:
+                    st.subheader("Result")
+                    st.dataframe(result_df)
+            except Exception as e:
+                st.error(f"Error: {e}")
+else:
+    st.info("Upload an Excel file to begin.")
