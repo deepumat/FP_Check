@@ -1,83 +1,123 @@
-import os, json, difflib
-from typing import List, Dict, Any, Optional
+#!/usr/bin/env python3
+"""
+excel_nl_query_claude_fuzzy_or.py
+
+- Uses Anthropic/Claude to convert NL -> JSON query.
+- Supports AND / OR filters.
+- Performs fuzzy matching of column names to DataFrame columns.
+- Backwards-compatible with the earlier simple JSON filter style.
+
+Requirements:
+pip install anthropic pandas openpyxl python-dateutil
+Set env var: ANTHROPIC_API_KEY
+
+Run:
+python excel_nl_query_claude_fuzzy_or.py data.xlsx -q "Show top 10 orders where city is Bangalore OR city contains 'Delhi', return name and amount"
+"""
+import os
+import json
+import argparse
+import difflib
+from typing import Dict, List, Any, Optional
 import pandas as pd
-import streamlit as st
 from anthropic import Anthropic
 
-# Config
+# ---------- CONFIG ----------
 DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620")
 API_KEY_ENV = "ANTHROPIC_API_KEY"
 MAX_TOKENS = 1200
 SAMPLE_ROWS = 6
-FUZZY_CUTOFF = 0.6
+FUZZY_CUTOFF = 0.6  # 0-1, higher = stricter
+# ----------------------------
 
 SYSTEM_PROMPT_TEMPLATE = """
 You are a data-query assistant. You will receive a table schema (column names and dtypes),
 a few sample rows, and a user's natural-language question.
 
-Return ONLY valid JSON (no markdown, no backticks) using this schema:
+Return ONLY valid JSON (no markdown, no backticks). Use this schema:
 
-{
+{{
   "select": ["column1","column2", ...] OR "ALL",
-  "filter": {
-    "and": [ { "column": "colname", "op":"contains|eq|gt|gte|lt|lte|in", "value": ... }, ... ],
-    "or":  [ { "column": "colname", "op":"contains|eq|gt|gte|lt|lte|in", "value": ... }, ... ]
-  },
-  "sort": { "column": "asc|desc" },
+  "filter": {{
+    "and": [ {{ "column": "colname", "op":"contains|eq|gt|gte|lt|lte|in", "value": ... }}, ... ],
+    "or":  [ {{ "column": "colname", "op":"contains|eq|gt|gte|lt|lte|in", "value": ... }}, ... ]
+  }},
+  "sort": {{ "column": "asc|desc" }},
   "limit": integer
-}
+}}
 
-Conventions:
-- "contains" = case-insensitive substring.
-- "in" = a JSON array or comma-separated list.
-- Column names may be approximate; the executor will map them to actual columns.
-- NEVER include code or commentary. Output must be only parsable JSON.
+Rules / conventions:
+- "contains" = case-insensitive substring match.
+- "in" = membership in a list (value should be a JSON array).
+- Either/both of "and" or "or" may be present under "filter". If user implies only one condition, prefer "and".
+- Column names in the JSON may be approximate (e.g., "cust name" for "Customer Name"). Use the names the user uses; the executor will map to real columns.
+- If the user asked for "all columns" or did not specify, set "select": "ALL".
+- If numeric comparisons are requested, use op "gt/gte/lt/lte" and supply numeric value.
+- NEVER include Python code or explanation. Output must be parsable JSON and nothing else.
+
 Table schema (column: dtype):
 {schema}
+
 Sample rows:
 {sample}
 """.strip()
 
-def build_schema_and_sample(df: pd.DataFrame):
-    return [{"column": c, "dtype": str(df[c].dtype)} for c in df.columns], df.head(SAMPLE_ROWS).to_dict(orient="records")
+# ---------------- helper functions ----------------
 
-def extract_json_from_text(text: str):
+def build_schema_and_sample(df: pd.DataFrame):
+    schema = [{"column": c, "dtype": str(df[c].dtype)} for c in df.columns]
+    sample = df.head(SAMPLE_ROWS).to_dict(orient="records")
+    return schema, sample
+
+def call_claude_get_json(schema, sample, user_question: str, model: str = DEFAULT_MODEL) -> Dict[str, Any]:
+    if API_KEY_ENV not in os.environ:
+        raise RuntimeError(f"Set {API_KEY_ENV} environment variable.")
+    client = Anthropic(api_key=os.environ.get(API_KEY_ENV))
+
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(schema=json.dumps(schema, indent=2),
+                                                 sample=json.dumps(sample, indent=2))
+
+    resp = client.messages.create(
+        model=model,
+        system=system_prompt,
+        messages=[{"role": "user", "content": f"User question:\n{user_question}\n\nReturn ONLY JSON."}],
+        max_tokens=MAX_TOKENS,
+    )
+
+    # Combine text blocks
+    text = "".join(block.text for block in resp.content if getattr(block, "type", None) == "text")
+    return extract_json_from_text(text)
+
+def extract_json_from_text(text: str) -> Dict[str, Any]:
     text = text.strip()
+    # Strip triple backticks if present
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
             text = text[4:].lstrip()
+
+    # Try direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        # Fallback: find first JSON object substring
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            return json.loads(text[start:end+1])
-        raise
-
-def call_claude(df: pd.DataFrame, question: str):
-    if API_KEY_ENV not in os.environ:
-        raise RuntimeError(f"Set {API_KEY_ENV} env var.")
-    client = Anthropic(api_key=os.environ.get(API_KEY_ENV))
-    schema, sample = build_schema_and_sample(df)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(schema=json.dumps(schema, indent=2), sample=json.dumps(sample, indent=2))
-    resp = client.messages.create(
-        model=DEFAULT_MODEL,
-        system=system_prompt,
-        messages=[{"role": "user", "content": f"User question:\n{question}\n\nReturn ONLY JSON."}],
-        max_tokens=MAX_TOKENS,
-    )
-    text = "".join(block.text for block in resp.content if getattr(block, "type", None) == "text")
-    return extract_json_from_text(text)
+            candidate = text[start:end+1]
+            return json.loads(candidate)
+        raise ValueError("Unable to parse JSON from model response.")
 
 def map_column_name(requested: str, columns: List[str], cutoff=FUZZY_CUTOFF) -> Optional[str]:
+    # Exact match (case-insensitive)
     for c in columns:
         if c.lower() == requested.lower():
             return c
+    # Use get_close_matches
     matches = difflib.get_close_matches(requested, columns, n=1, cutoff=cutoff)
     if matches:
         return matches[0]
+    # Try tokenized partial match: any column containing any token
     tokens = [t.lower() for t in requested.replace("_", " ").split()]
     for c in columns:
         lowc = c.lower()
@@ -85,148 +125,182 @@ def map_column_name(requested: str, columns: List[str], cutoff=FUZZY_CUTOFF) -> 
             return c
     return None
 
+def normalize_query_columns(query: Dict[str, Any], df_columns: List[str]) -> Dict[str, Any]:
+    warnings = []
+    def map_in_condition(cond: Dict[str, Any]) -> Dict[str, Any]:
+        col = cond.get("column")
+        if not col:
+            return cond
+        mapped = map_column_name(col, df_columns)
+        if mapped and mapped != col:
+            warnings.append(f"Mapped requested column '{col}' -> '{mapped}'")
+            cond["column_mapped"] = mapped
+        elif mapped is None:
+            warnings.append(f"Could not map requested column '{col}'; leaving as-is (may error).")
+            cond["column_mapped"] = col  # leave original
+        else:
+            cond["column_mapped"] = mapped
+        return cond
+
+    q = dict(query)  # shallow copy
+    fil = q.get("filter")
+    if isinstance(fil, dict):
+        for key in ("and", "or"):
+            if key in fil and isinstance(fil[key], list):
+                fil[key] = [map_in_condition(cond) for cond in fil[key]]
+        # legacy: if filter is flat dict like {"city__contains": "Delhi"}, convert to list 'and'
+    elif isinstance(fil, dict) and any("__" in k for k in fil.keys()):
+        # handled later in executor
+        pass
+
+    q["__warnings"] = warnings
+    return q
+
+# ---------- execution ----------
+
 def evaluate_condition(df: pd.DataFrame, cond: Dict[str, Any]) -> pd.Series:
+    # cond shape: {"column_mapped": "...", "op": "...", "value": ...}
     col = cond.get("column_mapped") or cond.get("column")
     op = cond.get("op", "eq")
     val = cond.get("value")
     if col not in df.columns:
-        return pd.Series([False]*len(df), index=df.index)
-    s = df[col]
+        # Return a boolean series of False (no rows)
+        return pd.Series([False] * len(df), index=df.index)
+
+    series = df[col]
     if op == "contains":
-        return s.astype(str).str.contains(str(val), case=False, na=False)
+        return series.astype(str).str.contains(str(val), case=False, na=False)
     if op == "eq":
-        return s == val
+        # try numeric coercion fallback
+        try:
+            return series == val
+        except Exception:
+            return series.astype(str) == str(val)
     if op == "gt":
-        return pd.to_numeric(s, errors="coerce") > float(val)
+        return pd.to_numeric(series, errors="coerce") > float(val)
     if op == "gte":
-        return pd.to_numeric(s, errors="coerce") >= float(val)
+        return pd.to_numeric(series, errors="coerce") >= float(val)
     if op == "lt":
-        return pd.to_numeric(s, errors="coerce") < float(val)
+        return pd.to_numeric(series, errors="coerce") < float(val)
     if op == "lte":
-        return pd.to_numeric(s, errors="coerce") <= float(val)
+        return pd.to_numeric(series, errors="coerce") <= float(val)
     if op == "in":
-        if isinstance(val, (list, tuple, set)):
-            items = [str(x) for x in val]
-        elif isinstance(val, str):
-            items = [v.strip() for v in val.split(",") if v.strip()]
+        if not isinstance(val, (list, tuple, set)):
+            # if model gave comma-separated string, split
+            if isinstance(val, str):
+                items = [v.strip() for v in val.split(",") if v.strip()]
+            else:
+                items = [val]
         else:
-            items = [str(val)]
-        return s.astype(str).isin(items)
-    return pd.Series([False]*len(df), index=df.index)
+            items = list(val)
+        # comparison: strings vs numbers handled by converting to str for membership
+        return series.astype(str).isin([str(x) for x in items])
+    # unknown op
+    return pd.Series([False] * len(df), index=df.index)
 
-def normalize_and_execute(df: pd.DataFrame, query: Dict[str, Any]):
+def execute_query(df: pd.DataFrame, query: Dict[str, Any]) -> pd.DataFrame:
+    # Handle legacy flat filter form (e.g., {"city__contains": "Delhi"})
+    result = df.copy()
     warnings = []
-    # Map columns in filter lists
-    fil = query.get("filter")
-    if isinstance(fil, dict):
-        for side in ("and", "or"):
-            if side in fil and isinstance(fil[side], list):
-                for cond in fil[side]:
-                    col = cond.get("column")
-                    if col:
-                        mapped = map_column_name(col, list(df.columns))
-                        if mapped:
-                            cond["column_mapped"] = mapped
-                            if mapped != col:
-                                warnings.append(f"Mapped '{col}' -> '{mapped}'")
-                        else:
-                            cond["column_mapped"] = col
-                            warnings.append(f"Could not map '{col}' to any column (left as-is).")
-    else:
-        # handle legacy flat form later
-        pass
 
-    # Legacy: handle flat filter {... "city__contains": "Delhi"}
-    if not fil:
-        legacy = query.get("filter") or {}
-        if isinstance(legacy, dict) and any("__" in k for k in legacy.keys()):
-            fil = {"and": []}
-            for k, v in legacy.items():
+    # Normalize columns in query (map fuzzy)
+    q_norm = normalize_query_columns(query, list(df.columns))
+    warnings.extend(q_norm.get("__warnings", []))
+
+    fil = q_norm.get("filter")
+    if fil is None:
+        # maybe legacy flat form
+        legacy_filter = query.get("filter") or {}
+        if isinstance(legacy_filter, dict) and any("__" in k for k in legacy_filter.keys()):
+            # convert to 'and' list
+            and_list = []
+            for k, v in legacy_filter.items():
                 if "__" in k:
                     col, op = k.split("__", 1)
                     mapped = map_column_name(col, list(df.columns))
-                    fil["and"].append({"column_mapped": mapped or col, "op": op, "value": v})
-            query["filter"] = fil
+                    and_list.append({"column_mapped": mapped or col, "op": op, "value": v})
+            fil = {"and": and_list}
+    # fil may now be structured as {"and": [...], "or": [...]}
+    if isinstance(fil, dict):
+        # Evaluate 'and' conditions
+        mask = pd.Series(True, index=result.index)
+        if "and" in fil and isinstance(fil["and"], list) and fil["and"]:
+            for cond in fil["and"]:
+                cond_mask = evaluate_condition(result, cond)
+                mask = mask & cond_mask
 
-    # Evaluate masks
-    mask = pd.Series(True, index=df.index)
-    if isinstance(query.get("filter"), dict):
-        f = query["filter"]
-        if "and" in f and isinstance(f["and"], list) and f["and"]:
-            for cond in f["and"]:
-                mask = mask & evaluate_condition(df, cond)
-        if "or" in f and isinstance(f["or"], list) and f["or"]:
-            or_mask = pd.Series(False, index=df.index)
-            for cond in f["or"]:
-                or_mask = or_mask | evaluate_condition(df, cond)
-            mask = (mask & or_mask) if ("and" in f and f["and"]) else or_mask
-    result = df[mask]
+        # Evaluate 'or' conditions
+        if "or" in fil and isinstance(fil["or"], list) and fil["or"]:
+            or_mask = pd.Series(False, index=result.index)
+            for cond in fil["or"]:
+                cond_mask = evaluate_condition(result, cond)
+                or_mask = or_mask | cond_mask
+            mask = mask & or_mask if ("and" in fil and fil["and"]) else or_mask
+
+        result = result[mask]
 
     # SELECT
-    select = query.get("select")
+    select = q_norm.get("select")
     if select and select != "ALL":
+        # map column names in select if fuzzy
         mapped_select = []
         for s in select:
             mapped = map_column_name(s, list(df.columns))
             if mapped:
                 mapped_select.append(mapped)
                 if mapped != s:
-                    warnings.append(f"Mapped select '{s}' -> '{mapped}'")
+                    warnings.append(f"Mapped select column '{s}' -> '{mapped}'")
             else:
                 warnings.append(f"Select column '{s}' not found; ignoring.")
         if mapped_select:
             result = result.loc[:, mapped_select]
 
     # SORT
-    sort_spec = query.get("sort")
+    sort_spec = q_norm.get("sort")
     if isinstance(sort_spec, dict) and sort_spec:
         col, order = list(sort_spec.items())[0]
         mapped = map_column_name(col, list(df.columns))
         if mapped:
-            result = result.sort_values(by=mapped, ascending=(order.lower()=="asc"))
+            try:
+                ascending = (order.lower() == "asc")
+                result = result.sort_values(by=mapped, ascending=ascending)
+            except Exception as e:
+                warnings.append(f"Sort on '{col}' failed: {e}")
         else:
             warnings.append(f"Sort column '{col}' not found; skipping sort.")
 
     # LIMIT
-    limit = query.get("limit")
+    limit = q_norm.get("limit")
     if isinstance(limit, int) and limit > 0:
         result = result.head(limit)
 
-    return result, warnings
+    # Print warnings if any
+    if warnings:
+        print("=== Executor warnings ===")
+        for w in warnings:
+            print(" -", w)
+    return result
 
-# ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="Excel NL Query (Claude) — fuzzy & OR", layout="wide")
-st.title("Excel natural-language query (Claude) — OR + fuzzy column names")
+# ---------- CLI ----------
 
-uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-if uploaded:
-    xls = pd.ExcelFile(uploaded)
-    sheet = st.selectbox("Sheet", xls.sheet_names)
-    df = xls.parse(sheet)
-    st.markdown(f"**Columns:** {', '.join(df.columns[:30])}{'...' if len(df.columns)>30 else ''}")
-    st.dataframe(df.head(8))
+def main():
+    parser = argparse.ArgumentParser(description="Query an Excel file with Claude; supports OR and fuzzy columns.")
+    parser.add_argument("excel_path", help="Path to Excel (.xlsx)")
+    parser.add_argument("-s", "--sheet", help="Sheet name (optional)", default=None)
+    parser.add_argument("-q", "--question", help="Natural-language question", required=True)
+    args = parser.parse_args()
 
-    question = st.text_area("Question (natural language)", height=140,
-                           placeholder="e.g. Show rows where city is Bangalore OR city contains 'Delhi' and return customer name and amount. Top 20.")
-    if st.button("Run"):
-        if not question.strip():
-            st.warning("Enter a question.")
-        else:
-            try:
-                with st.spinner("Calling Claude..."):
-                    query_json = call_claude(df, question)
-                st.subheader("JSON returned by Claude")
-                st.json(query_json)
-                with st.spinner("Executing..."):
-                    result_df, warns = normalize_and_execute(df, query_json)
-                if warns:
-                    st.warning("Warnings:\n" + "\n".join(warns))
-                if result_df.empty:
-                    st.info("No rows matched the query.")
-                else:
-                    st.subheader("Result")
-                    st.dataframe(result_df)
-            except Exception as e:
-                st.error(f"Error: {e}")
-else:
-    st.info("Upload an Excel file to begin.")
+    df = pd.read_excel(args.excel_path, sheet_name=args.sheet)
+    schema, sample = build_schema_and_sample(df)
+    query_json = call_claude_get_json(schema, sample, args.question)
+    print("=== JSON returned by Claude ===")
+    print(json.dumps(query_json, indent=2))
+    print("\n=== Executing query ===")
+    result = execute_query(df, query_json)
+    if result.empty:
+        print("No rows matched.")
+    else:
+        print(result.head(100).to_string(index=False))
+
+if __name__ == "__main__":
+    main()
