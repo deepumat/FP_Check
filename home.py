@@ -1,94 +1,141 @@
-# Home.py
+# app.py
 import streamlit as st
 import pandas as pd
-import streamlit.components.v1 as components
-from urllib.parse import urlencode
 
-st.set_page_config(page_title="Documents - Home", layout="wide")
+st.set_page_config(page_title="Docs (Single-file navigation)", layout="wide")
 
-# Data - replace with your real source
+# -----------------------
+# Sample data (replace)
+# -----------------------
 df = pd.DataFrame({
     "id": [101, 102, 103, 104],
     "title": ["Contract_A.pdf", "Invoice_B.pdf", "Report_C.pdf", "Specs_D.pdf"],
     "owner": ["Alice", "Bob", "Carol", "Dave"],
-    "modified": ["2025-11-20", "2025-11-25", "2025-12-01", "2025-12-06"]
+    "modified": ["2025-11-20", "2025-11-25", "2025-12-01", "2025-12-06"],
+    "summary": [
+        "Contract with vendor X — 12 pages.",
+        "Invoice for order #4321 — paid.",
+        "Quarterly report — contains charts.",
+        "Technical specs v2.1 — draft."
+    ]
 })
+
+# -----------------------
+# Session state defaults
+# -----------------------
+if "page" not in st.session_state:
+    # possible values: "list", "details", "other"
+    st.session_state.page = "list"
 
 if "selected_doc_id" not in st.session_state:
     st.session_state.selected_doc_id = None
 
+# -----------------------
+# Helper navigation functions
+# -----------------------
+def go_to_list():
+    st.session_state.selected_doc_id = None
+    st.session_state.page = "list"
+
 def open_doc(doc_id: int):
-    """Set session state + query param and attempt a JS redirect.
-    If JS is blocked, the visible fallback link below allows manual click.
-    """
-    # 1) primary: set session state
     st.session_state.selected_doc_id = int(doc_id)
+    st.session_state.page = "details"
 
-    # 2) defensive: set query params (so details page can recover on full reload)
-    params = {"doc": str(doc_id)}
-    st.experimental_set_query_params(**params)
+# -----------------------
+# Sidebar (optional)
+# -----------------------
+with st.sidebar:
+    st.title("Navigation")
+    # show current "page" in the sidebar - optional visible control for debugging
+    choice = st.radio(
+        "Page",
+        options=["list", "details", "other"],
+        index=["list", "details", "other"].index(st.session_state.page),
+        on_change=lambda: setattr(st.session_state, "page", st.session_state.get("page_radio", "list"))
+    )
+    # keep the radio in sync with session_state.page (readonly style)
+    # We don't expect users to change this radio; it's for visibility.
+    st.markdown("---")
+    st.write("Use the app UI to navigate (Open / Back buttons).")
 
-    # 3) attempt JS redirect using components.html (more reliable than st.markdown JS)
-    #    We build a URL that keeps the same pathname but appends the query string.
-    target = "?" + urlencode(params)
-    js = f"""
-    <script>
-      try {{
-        // attempt to change the URL (this will not reload the page by itself)
-        const newUrl = window.location.origin + window.location.pathname + "{target}";
-        // Some Streamlit deployments require a full reload to switch pages.
-        // Attempt to navigate to the new URL (this reloads the app and lands on the page
-        // which will read the 'doc' query param).
-        window.location.href = newUrl;
-      }} catch(e) {{
-        // swallow errors; fallback UI will show link
-        console.log('redirect failed', e);
-      }}
-    </script>
-    """
-    # Use components.html to ensure the browser runs the script immediately
-    components.html(js, height=0, width=0)
+# -----------------------
+# Main rendering logic
+# -----------------------
+def render_list_view():
+    st.header("Documents")
+    st.write("Click **Open** to view a document's details below.")
 
-    # Defensive rerun (in case JS doesn't execute or is blocked)
-    st.experimental_rerun()
+    # Native table for visuals
+    st.dataframe(df.set_index("id"), use_container_width=True)
 
+    st.write("")  # spacing
 
-st.title("Documents")
-st.write("Click **Open** to view details on the Document Details page.")
+    # Layout: buttons column + info column
+    buttons_col, info_col = st.columns([1, 7])
 
-# Show table for context
-st.dataframe(df.set_index("id"), use_container_width=True)
+    with buttons_col:
+        for doc_id in df["id"]:
+            if st.button("Open", key=f"open_{doc_id}"):
+                open_doc(doc_id)
 
-st.write("")  # spacing
+    with info_col:
+        for _, row in df.iterrows():
+            st.markdown(f"**{row['title']}** — {row['owner']} — {row['modified']}")
 
-buttons_col, info_col = st.columns([1, 6])
+    st.divider()
+    sel = st.session_state.get("selected_doc_id")
+    if sel:
+        st.info(f"Selected document id (in session): {sel}")
+    else:
+        st.info("No document selected yet.")
 
-with buttons_col:
-    for doc_id in df["id"]:
-        if st.button("Open", key=f"open_{doc_id}"):
-            open_doc(doc_id)
+def render_details_view():
+    sel_id = st.session_state.get("selected_doc_id")
+    st.header("Document Details")
 
-with info_col:
-    for _, row in df.iterrows():
-        st.markdown(f"**{row['title']}** — {row['owner']} — {row['modified']}")
+    if sel_id is None:
+        st.warning("No document selected. Use the Documents page to open one.")
+        if st.button("Back to list"):
+            go_to_list()
+    else:
+        row = df[df["id"] == sel_id]
+        if row.empty:
+            st.error(f"Selected document id {sel_id} not found.")
+            if st.button("Back to list"):
+                go_to_list()
+        else:
+            row = row.iloc[0]
+            st.subheader(row["title"])
+            st.markdown(f"**Owner:** {row['owner']}")
+            st.markdown(f"**Last modified:** {row['modified']}")
+            st.markdown("---")
+            st.subheader("Summary")
+            st.write(row["summary"])
+            st.markdown("---")
 
-st.markdown("---")
-sel = st.session_state.get("selected_doc_id")
-if sel:
-    st.info(f"Selected document id: {sel}")
+            # Example actions
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("Back to list", key="back_button"):
+                    go_to_list()
+            with col2:
+                if st.button("Open in new tab (fallback)", key="open_new_tab"):
+                    # Open details in a new browser tab by creating a URL with a query param,
+                    # but note: some hosts or browsers may block JS. This is an optional convenience.
+                    params = f"?doc={sel_id}"
+                    url = st.runtime.scriptrunner.get_script_run_ctx().session_id if False else None
+                    st.write("Use the 'Back to list' button for reliable navigation.")
+
+def render_other_view():
+    st.header("Other")
+    st.write("Other app content goes here.")
+    if st.button("Back to list"):
+        go_to_list()
+
+# Choose which view to render
+if st.session_state.page == "list":
+    render_list_view()
+elif st.session_state.page == "details":
+    render_details_view()
 else:
-    st.info("No document selected yet.")
-
-# Visible fallback: instructive clickable link (if JS is blocked)
-st.markdown(
-    """
-    **If clicking Open does not navigate automatically:**\n
-    - Try the visible link next to a document (opens same page) or refresh the browser.
-    - If you want immediate navigation without a reload, consider using AgGrid row-click (I can provide that).
-    """
-)
-# Show explicit manual links for each doc (visible fallback)
-for _, row in df.iterrows():
-    doc_id = row["id"]
-    link = f"[Open {row['title']}](?doc={doc_id})"
-    st.write(link)
+    render_other_view()
