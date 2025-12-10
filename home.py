@@ -107,4 +107,60 @@ if tab == "Documents List":
                     view_key = f"view_{int(row['doc_id'])}"
                     if cols[3].button("View Details", key=view_key):
                         st.session_state.selected_doc = int(row["doc_id"])
-                        st
+                        st.session_state.active_tab = "details"
+                        st.experimental_rerun()
+
+# -------------------------
+# Document Details view
+# -------------------------
+if tab == "Document Details":
+    # Keep session state consistent with the radio
+    st.session_state.active_tab = "details"
+
+    st.header("Document Details")
+
+    if st.session_state.selected_doc is None:
+        st.warning("No document selected. Select a document in Documents List (use sidebar → Documents List).")
+    else:
+        # fetch the selected document
+        sel_id = st.session_state.selected_doc
+        row_df = docs[docs["doc_id"] == sel_id]
+
+        if row_df.empty:
+            st.error(f"Selected document id {sel_id} not found.")
+        else:
+            row = row_df.iloc[0]
+            # Two-column layout for details + actions
+            left, right = st.columns([3, 1])
+
+            left.subheader(f"{row['name']} (ID: {int(row['doc_id'])})")
+            left.markdown(f"**Status:** {row['status']}")
+            left.markdown(f"**Owner:** {row['owner']}")
+            left.markdown(f"**Created:** {row['created']}")
+            left.markdown("**Summary**")
+            left.write(row["summary"])
+
+            # Example additional details (replace with real fields)
+            left.markdown("---")
+            left.markdown("**Metadata**")
+            md_table = pd.DataFrame({
+                "field": ["doc_id", "name", "status", "owner", "created"],
+                "value": [int(row['doc_id']), row['name'], row['status'], row['owner'], row['created']]
+            })
+            left.table(md_table)
+
+            # Actions
+            right.markdown("## Actions")
+            if right.button("Back to list"):
+                st.session_state.active_tab = "list"
+                st.experimental_rerun()
+
+            # placeholders: download/view/annotate
+            right.button("Download (placeholder)")
+            right.button("Open in external viewer (placeholder)")
+
+# -------------------------
+# Footer / diagnostics (optional)
+# -------------------------
+st.markdown("---")
+st.caption("Tip: use the sidebar to search and filter documents. Clicking 'View Details' navigates to the details view.")
