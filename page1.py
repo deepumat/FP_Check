@@ -1,29 +1,11 @@
 # pages/Document Details.py
 import streamlit as st
+import pandas as pd
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Document Details")
 
-# Helper: try session_state first, fallback to query params
-def get_selected_doc_id():
-    # 1) session_state
-    if st.session_state.get("selected_doc_id") is not None:
-        return int(st.session_state["selected_doc_id"])
-
-    # 2) query params fallback
-    params = st.experimental_get_query_params()
-    doc_vals = params.get("doc")
-    if doc_vals:
-        try:
-            return int(doc_vals[0])
-        except (ValueError, TypeError):
-            return None
-
-    # nothing found
-    return None
-
-
-# For this demo, re-create the same dataset or load it from your source.
-import pandas as pd
+# Sample data (same source as Home.py)
 df = pd.DataFrame({
     "id": [101, 102, 103, 104],
     "title": ["Contract_A.pdf", "Invoice_B.pdf", "Report_C.pdf", "Specs_D.pdf"],
@@ -37,17 +19,33 @@ df = pd.DataFrame({
     ]
 })
 
+def get_selected_doc_id():
+    # 1) preferred: session_state
+    if st.session_state.get("selected_doc_id") is not None:
+        return int(st.session_state.selected_doc_id)
+
+    # 2) fallback: query params
+    params = st.experimental_get_query_params()
+    doc_vals = params.get("doc")
+    if doc_vals:
+        try:
+            return int(doc_vals[0])
+        except (ValueError, TypeError):
+            return None
+
+    return None
+
 st.title("Document Details")
 
 sel_id = get_selected_doc_id()
 
 if sel_id is None:
-    st.warning("No document selected. Please select a document from the Home page.")
-    st.write("Tip: return to the Home page and click an 'Open' button for a document.")
+    st.warning("No document selected. Select from Home or click a visible link in Home.")
+    st.write("You can also manually append `?doc=<id>` to the app URL.")
 else:
     row = df[df["id"] == sel_id]
     if row.empty:
-        st.error(f"Selected document id {sel_id} not found in the data source.")
+        st.error(f"Selected document id {sel_id} not found.")
     else:
         row = row.iloc[0]
         st.header(row["title"])
@@ -58,13 +56,11 @@ else:
         st.write(row["summary"])
 
         st.markdown("---")
-        st.write("Actions:")
         if st.button("Back to list"):
-            # Clear selection and navigate back to Home (root).
+            # clear selection and navigate to Home root
             st.session_state.selected_doc_id = None
-            # Clear query params for cleanliness
-            st.experimental_set_query_params()
-            # JS redirect back to the Home page (root)
+            st.experimental_set_query_params()  # clear params
+            # Attempt JS redirect back to root
             js = "<script>window.location.href = window.location.origin + window.location.pathname;</script>"
-            st.markdown(js, unsafe_allow_html=True)
+            components.html(js, height=0, width=0)
             st.experimental_rerun()
