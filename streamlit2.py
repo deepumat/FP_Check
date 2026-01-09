@@ -1,63 +1,105 @@
-import pandas as pd
-
-data = [
-    {"id": "BT", "parent": None, "title": "BT_Master Technology Agreement", "contract": "CW7047"},
-    {"id": "BT1", "parent": "BT", "title": "Global Network & Hardware Maintenance Renewal 2020", "contract": "CW7240"},
-    {"id": "BT2", "parent": "BT", "title": "Flexible Cloud License – 5 Years (Singapore)", "contract": "CW8734"},
-    {"id": "BT3", "parent": "BT", "title": "Crossbalance Switch Replacement – Malaysia", "contract": "CW7590"},
-
-    {"id": "CANCEL", "parent": None, "title": "Cancelled", "contract": ""},
-    {"id": "HK", "parent": "CANCEL", "title": "MAC Order Form – Hong Kong 2021", "contract": "CW4003"},
-    {"id": "CN", "parent": "CANCEL", "title": "MAC Order Form – China 2021", "contract": "CW4004"},
-    {"id": "UAE", "parent": "CANCEL", "title": "MAC Order Form – UAE 2021", "contract": "CW4005"},
-]
-
-df = pd.DataFrame(data)
-
-def build_path(row, df):
-    path = [row["title"]]
-    parent = row["parent"]
-
-    while parent:
-        parent_row = df[df["id"] == parent].iloc[0]
-        path.insert(0, parent_row["title"])
-        parent = parent_row["parent"]
-
-    return path
-
-df["path"] = df.apply(lambda r: build_path(r, df), axis=1)
-
 import streamlit as st
-from st_aggrid import AgGrid, GridOptionsBuilder
+import pandas as pd
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+from st_aggrid.shared import JsCode
 
 st.set_page_config(layout="wide")
-st.title("Agreement Tree")
 
+# 1. Sample Data (Hierarchical structure)
+data = {
+    'Project': ['Project A', 'Project B', 'Project C'],
+    'Manager': ['Alice', 'Bob', 'Charlie'],
+    'Status': ['In Progress', 'Completed', 'On Hold'],
+    'Details': [
+        [{'Task': 'Design', 'Hours': 40}, {'Task': 'Implement', 'Hours': 120}],
+        [{'Task': 'Test', 'Hours': 30}, {'Task': 'Deploy', 'Hours': 10}],
+        [{'Task': 'Research', 'Hours': 80}]
+    ]
+}
+df = pd.DataFrame(data)
+
+# 2. JavaScript Code for the Row Expander and Nested Grid
+# This JS snippet defines a cell renderer that, when clicked, creates a new AgGrid instance
+# within an expander element in the row details.
+row_expander_renderer = JsCode("""
+class RowExpanderRenderer {
+    init(params) {
+        this.eGui = document.createElement('div');
+        this.eGui.innerHTML = `
+            <button style="border: none; background: none; cursor: pointer;">
+                +
+            </button>
+        `;
+        this.expanded = false;
+        this.detailsDiv = document.createElement('div');
+        this.detailsDiv.style.display = 'none';
+        this.eGui.appendChild(this.detailsDiv);
+        
+        this.eGui.querySelector('button').addEventListener('click', () => {
+            this.toggleDetails(params.data);
+        });
+    }
+
+    getGui() {
+        return this.eGui;
+    }
+
+    toggleDetails(data) {
+        this.expanded = !this.expanded;
+        if (this.expanded) {
+            this.eGui.querySelector('button').textContent = '-';
+            this.detailsDiv.style.display = 'block';
+            this.renderNestedGrid(data.Details);
+        } else {
+            this.eGui.querySelector('button').textContent = '+';
+            this.detailsDiv.style.display = 'none';
+            // Destroy the nested grid instance when collapsing to prevent memory leaks/conflicts
+            if (this.nestedGridApi) {
+                this.nestedGridApi.destroy();
+            }
+        }
+    }
+
+    renderNestedGrid(detailsData) {
+        const gridOptions = {
+            columnDefs: [
+                { headerName: "Task", field: "Task", flex: 1 },
+                { headerName: "Hours", field: "Hours", flex: 1 }
+            ],
+            rowData: detailsData,
+            domLayout: 'autoHeight',
+            // Add any other desired grid options for the nested table
+        };
+        // Use the AgGrid API to create a new grid in the details div
+        new agGrid.Grid(this.detailsDiv, gridOptions);
+        this.nestedGridApi = gridOptions.api;
+    }
+}
+""")
+
+# 3. Configure the main grid using GridOptionsBuilder
 gb = GridOptionsBuilder.from_dataframe(df)
 
-gb.configure_grid_options(
-    treeData=True,
-    getDataPath="function(data) { return data.path; }",
-    autoGroupColumnDef={
-        "headerName": "Agreement Title",
-        "cellRendererParams": {
-            "suppressCount": True,
-        },
-        "width": 600,
-    },
+# Configure a specific column to use the custom cell renderer
+gb.configure_column(
+    "Project",
+    cellRenderer=row_expander_renderer,
+    onCellClicked=JsCode("function(params) { params.colDef.cellRenderer.toggleDetails(params.data); }").js_code
 )
 
-gb.configure_column("contract", headerName="Contract Number", width=150)
-gb.configure_column("id", hide=True)
-gb.configure_column("parent", hide=True)
-gb.configure_column("path", hide=True)
+# Configure other columns as needed
+gb.configure_default_column(editable=False, filter=True)
+gb.configure_selection(selection_mode='single', use_checkbox=True)
 
-gridOptions = gb.build()
+grid_options = gb.build()
 
+# 4. Display the AgGrid table
+st.subheader("Projects Overview with Expandable Rows")
 AgGrid(
     df,
-    gridOptions=gridOptions,
-    use_container_width=True,
-    allow_unsafe_jscode=True,
-    enable_enterprise_modules=True
+    gridOptions=grid_options,
+    height=300,
+    allow_unsafe_jscode=True, # Must be True to use JsCode
+    update_mode=GridUpdateMode.SELECTION_CHANGED,
+    theme='streamlit'
 )
