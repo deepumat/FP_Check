@@ -1,0 +1,121 @@
+# pdf loader 
+
+import fitz
+import pytesseract
+from pdf2image import convert_from_path
+import os
+
+def is_scanned_pdf(path):
+    doc = fitz.open(path)
+    text = ""
+    for page in doc[:3]:
+        text += page.get_text()
+    return len(text.strip()) < 50
+
+def extract_text(path):
+    if not is_scanned_pdf(path):
+        doc = fitz.open(path)
+        return "\n".join([p.get_text() for p in doc])
+
+    # OCR
+    pages = convert_from_path(path)
+    text = ""
+    for img in pages:
+        text += pytesseract.image_to_string(img)
+    return text
+
+
+# chunking 
+
+def chunk_text(text, size=400, overlap=80):
+    words = text.split()
+    chunks = []
+
+    i = 0
+    while i < len(words):
+        chunk = words[i:i+size]
+        chunks.append(" ".join(chunk))
+        i += size - overlap
+
+    return chunks
+
+
+# embeddings 
+
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+def embed(texts):
+    return np.array(model.encode(texts, normalize_embeddings=True))
+
+# local vector store
+
+import numpy as np
+import pickle
+
+class LocalVectorStore:
+    def __init__(self):
+        self.embeddings = []
+        self.texts = []
+
+    def add(self, embeds, chunks):
+        self.embeddings.extend(embeds)
+        self.texts.extend(chunks)
+
+    def save(self, path="store.pkl"):
+        with open(path, "wb") as f:
+            pickle.dump((self.embeddings, self.texts), f)
+
+    def load(self, path="store.pkl"):
+        with open(path, "rb") as f:
+            self.embeddings, self.texts = pickle.load(f)
+
+    def search(self, query_embedding, k=5):
+        embs = np.array(self.embeddings)
+        scores = embs @ query_embedding
+        top = scores.argsort()[-k:][::-1]
+        return [(self.texts[i], scores[i]) for i in top]
+
+# ingest pdfs 
+
+import glob
+from pdf_loader import extract_text
+from chunker import chunk_text
+from embedder import embed
+from vector_store import LocalVectorStore
+
+store = LocalVectorStore()
+
+for pdf in glob.glob("pdfs/*.pdf"):
+    text = extract_text(pdf)
+    chunks = chunk_text(text)
+
+    vectors = embed(chunks)
+    store.add(vectors, chunks)
+
+store.save()
+print("Indexed PDFs")
+
+
+
+# retrieval 
+
+from embedder import embed
+from vector_store import LocalVectorStore
+
+store = LocalVectorStore()
+store.load()
+
+def retrieve(query):
+    qvec = embed([query])[0]
+    return store.search(qvec, k=5)
+
+query = "What is the termination clause?"
+results = retrieve(query)
+
+for text, score in results:
+    print(score)
+    print(text[:300])
+    print("----")
