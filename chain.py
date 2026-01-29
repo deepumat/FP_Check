@@ -1,3 +1,4 @@
+
 """ LangGraph tool-calling, conversation-aware contract analysis agent
 
 LLM is used ONLY for intent → tool planning All filtering & joins are deterministic """
@@ -61,7 +62,13 @@ LangGraph State (memory)
 
 =====================
 
-class ContractQueryState(BaseModel): vendor: Optional[str] = None missing_clauses: List[str] = [] present_clauses: List[str] = [] results: Optional[List[str]] = None
+class ContractQueryState(BaseModel): # conversation memory vendor: Optional[str] = None missing_clauses: List[str] = [] present_clauses: List[str] = []
+
+# latest user input (LangGraph requires inputs to be part of state)
+user_input: Optional[str] = None
+
+# execution output
+results: Optional[List[str]] = None
 
 =====================
 
@@ -164,7 +171,7 @@ LangGraph Nodes
 
 =====================
 
-def intent_node(state: ContractQueryState, input: str): """LLM planning node (ONLY LLM CALL)""" formatted_prompt = intent_prompt.format( input=input, state=state.dict() ) return llm.invoke(formatted_prompt) )
+def intent_node(state: ContractQueryState): """LLM planning node (ONLY LLM CALL) LangGraph nodes must accept ONLY state. """ formatted_prompt = intent_prompt.format( input=state.user_input, state=state.dict() ) return llm.invoke(formatted_prompt) )
 
 tools = [add_missing_clause, set_vendor, execute_query]
 
@@ -194,22 +201,31 @@ if name == "main": state = ContractQueryState()
 
 print("\n--- Turn 1 ---")
 state = graph.invoke({
-    "state": state,
-    "input": "Give me contracts without indemnity"
+    "vendor": state.vendor,
+    "missing_clauses": state.missing_clauses,
+    "present_clauses": state.present_clauses,
+    "results": state.results,
+    "user_input": "Give me contracts without indemnity"
 })
 print(state)
 
 print("\n--- Turn 2 ---")
 state = graph.invoke({
-    "state": state,
-    "input": "Only for vendor ABC"
+    "vendor": state.vendor,
+    "missing_clauses": state.missing_clauses,
+    "present_clauses": state.present_clauses,
+    "results": state.results,
+    "user_input": "Give me contracts without indemnity"
 })
 print(state)
 
 print("\n--- Turn 3 ---")
 state = graph.invoke({
-    "state": state,
-    "input": "Also missing confidentiality"
+    "vendor": state.vendor,
+    "missing_clauses": state.missing_clauses,
+    "present_clauses": state.present_clauses,
+    "results": state.results,
+    "user_input": "Give me contracts without indemnity"
 })
 print(state)
 
